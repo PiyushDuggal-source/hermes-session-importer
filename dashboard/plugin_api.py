@@ -68,60 +68,39 @@ def _oc_flatten_parts(parts: List[Dict[str, Any]]) -> Tuple[str, Dict[str, int]]
     return "\n\n".join(texts), counts
 
 
-def _merge_turns(raw_turns: List[Tuple[str, str]]) -> List[Dict[str, Any]]:
-    merged: List[Dict[str, str]] = []
-    for role, text in raw_turns:
+def _merge_turns(
+    raw_turns: List[Tuple[str, str]],
+    tool_meta: Optional[List[Optional[Dict[str, int]]]] = None,
+) -> List[Dict[str, Any]]:
+    """Merge consecutive same-role turns; guarantee strict alternation.
+
+    When ``tool_meta`` is given (parallel list), each merged turn aggregates
+    the counts of every source turn folded into it — no post-hoc matching.
+    """
+    merged: List[Dict[str, Any]] = []
+    for i, (role, text) in enumerate(raw_turns):
         text = text.strip()
-        if not text:
+        counts = tool_meta[i] if tool_meta else None
+        if not text and not counts:
             continue
         if merged and merged[-1]["role"] == role:
-            merged[-1]["content"] += "\n\n" + text
+            if text:
+                merged[-1]["content"] += "\n\n" + text
+            for name, n in (counts or {}).items():
+                prev = merged[-1].get("tools") or {}
+                prev[name] = prev.get(name, 0) + n
+                merged[-1]["tools"] = prev
         else:
-            merged.append({"role": role, "content": text})
+            entry: Dict[str, Any] = {"role": role, "content": text}
+            if counts:
+                entry["tools"] = dict(counts)
+            merged.append(entry)
     if merged and merged[0]["role"] == "assistant":
         merged.insert(0, {
             "role": "user",
             "content": "(imported conversation begins with an assistant reply)",
         })
     return merged
-
-
-def _fold_tools(
-    src_turns: List[Tuple[str, str]],
-    tool_meta: List[Optional[Dict[str, int]]],
-    merged_turns: List[Dict[str, str]],
-) -> List[Optional[Dict[str, int]]]:
-    """Fold per-source-turn tool counts into the merged turn list.
-
-    Walks both lists in parallel: whenever consecutive source turns were
-    merged into one output turn, their counts sum.
-    """
-    out: List[Optional[Dict[str, int]]] = []
-    src_i = 0
-    for merged in merged_turns:
-        agg: Dict[str, int] = {}
-        # count how many consecutive source turns compose this merged turn
-        while src_i < len(src_turns):
-            role, text = src_turns[src_i]
-            if out and merged["role"] == "assistant" and role == "assistant":
-                pass
-            if not _text_belongs(merged["content"], text):
-                break
-            for name, n in (tool_meta[src_i] or {}).items():
-                agg[name] = agg.get(name, 0) + n
-            src_i += 1
-            if not (
-                src_i < len(src_turns)
-                and src_turns[src_i][0] == role
-            ):
-                break
-        out.append(agg or None)
-    return out
-
-
-def _text_belongs(merged_text: str, piece: str) -> bool:
-    """True if ``piece`` is a substring of the merged text (merge invariant)."""
-    return piece in merged_text
 
 
 def _first_user_line(turns: List[Tuple[str, str]]) -> Optional[str]:
@@ -188,14 +167,9 @@ def parse_opencode_session(
                     tool_meta.append(dict(tools) if with_tools else None)
     finally:
         con.close()
-    result_turns = _merge_turns(turns)
-    if with_tools:
-        # _merge_turns merges consecutive same-role turns; fold tool counts
-        # the same way so each output turn carries its aggregate counts.
-        merged_tools = _fold_tools(turns, tool_meta, result_turns)
-        for t, tc in zip(result_turns, merged_tools):
-            if tc:
-                t["tools"] = tc
+    result_turns = _merge_turns(
+        turns, tool_meta if with_tools else None
+    )
     return {
         "turns": result_turns,
         "cwd": cwd,
