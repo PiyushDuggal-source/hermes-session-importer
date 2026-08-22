@@ -228,7 +228,12 @@ def list_opencode_sessions(
 
 
 def list_claude_sessions_meta(errors: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    """Discover Claude Code sessions via the stock importer's lister."""
+    """Discover Claude Code sessions via the stock importer's lister.
+
+    Note: ``turn_count`` here is the full-parse count; the OpenCode list
+    pass counts candidate messages only, so the two providers' counts are
+    not directly comparable (and may differ slightly from imported turns).
+    """
     from hermes_cli.foreign_sessions import list_claude_sessions
 
     out: List[Dict[str, Any]] = []
@@ -267,6 +272,10 @@ def imported_index(force: bool = False) -> Dict[str, Dict[str, str]]:
     # normalize to the lister's source names so lookups match.
     _ALIAS = {"claude-code": "claude", "codex-cli": "codex"}
     try:
+        # NOTE: `_conn` is SessionDB's private write connection — used here
+        # for a single-pass origin_json scan. If an upstream refactor renames
+        # it, this raises and /list degrades to errors[] visibly (never to a
+        # wrong dedup result), which is the safe failure mode.
         rows = db._conn.execute(
             "SELECT id, title, origin_json FROM sessions "
             "WHERE origin_json LIKE '%imported_from%' "
@@ -428,6 +437,8 @@ async def do_import(body: dict) -> Dict[str, Any]:
             from hermes_cli.foreign_sessions import import_foreign_session
 
             new_id = import_foreign_session("claude", path)
+            global _index_cache
+            _index_cache = None  # covers both providers (opencode path clears its own)
         else:
             return {"ok": False, "error": f"unknown source {src!r}"}
         return {"ok": True, "session_id": new_id}
