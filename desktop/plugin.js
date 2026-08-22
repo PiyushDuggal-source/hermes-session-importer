@@ -21,6 +21,7 @@ import {
   ErrorState,
   SearchField,
   Skeleton,
+  Streamdown,
   Tip,
   cn,
   haptic,
@@ -173,6 +174,22 @@ function DayHeader({ label, count }) {
   })
 }
 
+function ToolFooter({ tools }) {
+  const entries = Object.entries(tools).sort((a, b) => b[1] - a[1])
+  const label = entries.map(([name, n]) => `${n}× ${name}`).join(' · ')
+  return jsxs('div', {
+    className: 'mt-1 flex items-center gap-1.5 px-3 text-xs text-(--ui-text-tertiary)',
+    children: [
+      jsx(Codicon, { name: 'tools', size: 12 }),
+      jsx('span', {
+        className: 'truncate',
+        title: `This message made ${entries.reduce((a, [, n]) => a + n, 0)} tool calls: ${label}`,
+        children: label,
+      }),
+    ],
+  })
+}
+
 function Transcript({ rest, meta, onClose }) {
   const viewQuery = useQuery({
     queryKey: [ID, 'view', meta.source, meta.path],
@@ -211,11 +228,14 @@ function Transcript({ rest, meta, onClose }) {
         }),
         jsx('div', {
           className: cn(
-            'whitespace-pre-wrap rounded-md px-3 py-2 text-sm',
+            'rounded-md px-3 py-2 text-sm [&_p]:my-1 [&_pre]:overflow-x-auto [&_code]:text-xs',
             t.role === 'user' ? 'bg-(--chrome-action-hover)' : ''
           ),
-          children: t.content,
+          children: jsx(Streamdown, { children: t.content }),
         }),
+        t.tools
+          ? jsx(ToolFooter, { tools: t.tools })
+          : null,
       ]}, i))
     }),
   ]})

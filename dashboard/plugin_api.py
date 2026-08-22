@@ -44,8 +44,12 @@ _index_cached_at = 0.0
 # ── OpenCode → normalized turns (same contract as foreign_sessions) ──────
 
 
-def _oc_flatten_parts(parts: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
-    """Flatten one OpenCode message's parts to text + tool summaries."""
+def _oc_flatten_parts(parts: List[Dict[str, Any]]) -> Tuple[str, Dict[str, int]]:
+    """Flatten one OpenCode message's parts to text + tool summaries.
+
+    Returns (text, tool_counts) where tool_counts is a {tool_name: count}
+    dict — the viewer renders it as a footer; import flattens it inline.
+    """
     texts: List[str] = []
     tools: List[str] = []
     for part in parts:
@@ -56,12 +60,15 @@ def _oc_flatten_parts(parts: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
                 texts.append(t.strip())
         elif ptype == "tool":
             name = part.get("tool") or "tool"
-            tools.append(f"[ran tool: {name}]")
+            tools.append(name)
         # reasoning / step-start / step-finish / others: skipped
-    return "\n\n".join(texts), tools
+    counts: Dict[str, int] = {}
+    for name in tools:
+        counts[name] = counts.get(name, 0) + 1
+    return "\n\n".join(texts), counts
 
 
-def _merge_turns(raw_turns: List[Tuple[str, str]]) -> List[Dict[str, str]]:
+def _merge_turns(raw_turns: List[Tuple[str, str]]) -> List[Dict[str, Any]]:
     merged: List[Dict[str, str]] = []
     for role, text in raw_turns:
         text = text.strip()
@@ -79,6 +86,44 @@ def _merge_turns(raw_turns: List[Tuple[str, str]]) -> List[Dict[str, str]]:
     return merged
 
 
+def _fold_tools(
+    src_turns: List[Tuple[str, str]],
+    tool_meta: List[Optional[Dict[str, int]]],
+    merged_turns: List[Dict[str, str]],
+) -> List[Optional[Dict[str, int]]]:
+    """Fold per-source-turn tool counts into the merged turn list.
+
+    Walks both lists in parallel: whenever consecutive source turns were
+    merged into one output turn, their counts sum.
+    """
+    out: List[Optional[Dict[str, int]]] = []
+    src_i = 0
+    for merged in merged_turns:
+        agg: Dict[str, int] = {}
+        # count how many consecutive source turns compose this merged turn
+        while src_i < len(src_turns):
+            role, text = src_turns[src_i]
+            if out and merged["role"] == "assistant" and role == "assistant":
+                pass
+            if not _text_belongs(merged["content"], text):
+                break
+            for name, n in (tool_meta[src_i] or {}).items():
+                agg[name] = agg.get(name, 0) + n
+            src_i += 1
+            if not (
+                src_i < len(src_turns)
+                and src_turns[src_i][0] == role
+            ):
+                break
+        out.append(agg or None)
+    return out
+
+
+def _text_belongs(merged_text: str, piece: str) -> bool:
+    """True if ``piece`` is a substring of the merged text (merge invariant)."""
+    return piece in merged_text
+
+
 def _first_user_line(turns: List[Tuple[str, str]]) -> Optional[str]:
     for role, text in turns:
         if role == "user":
@@ -88,9 +133,17 @@ def _first_user_line(turns: List[Tuple[str, str]]) -> Optional[str]:
     return None
 
 
-def parse_opencode_session(db_path: Path, session_id: str) -> Dict[str, Any]:
-    """Parse one OpenCode session from its SQLite store into normalized turns."""
+def parse_opencode_session(
+    db_path: Path, session_id: str, with_tools: bool = False
+) -> Dict[str, Any]:
+    """Parse one OpenCode session from its SQLite store into normalized turns.
+
+    With ``with_tools=True`` each turn dict gains ``tools: {name: count}``
+    (assistant turns only) — used by the read-only /view route. Import keeps
+    the flattened inline form.
+    """
     turns: List[Tuple[str, str]] = []
+    tool_meta: List[Optional[Dict[str, int]]] = []
     cwd: Optional[str] = None
     title: Optional[str] = None
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -125,14 +178,26 @@ def parse_opencode_session(db_path: Path, session_id: str) -> Dict[str, Any]:
                 if not has_text_part or not text:
                     continue  # synthetic payload (diff summary etc.), never imported
                 turns.append((role, text))
+                tool_meta.append(None)
             else:
-                chunks = ([text] if text else []) + tools
-                if chunks:
+                chunks = [text] if text else []
+                if tools and not with_tools:
+                    chunks += [f"[ran tool: {name}]" for name in tools]
+                if chunks or (tools and with_tools):
                     turns.append(("assistant", "\n\n".join(chunks)))
+                    tool_meta.append(dict(tools) if with_tools else None)
     finally:
         con.close()
+    result_turns = _merge_turns(turns)
+    if with_tools:
+        # _merge_turns merges consecutive same-role turns; fold tool counts
+        # the same way so each output turn carries its aggregate counts.
+        merged_tools = _fold_tools(turns, tool_meta, result_turns)
+        for t, tc in zip(result_turns, merged_tools):
+            if tc:
+                t["tools"] = tc
     return {
-        "turns": _merge_turns(turns),
+        "turns": result_turns,
         "cwd": cwd,
         "title_guess": title or _first_user_line(turns),
         "session_id": session_id,
@@ -440,20 +505,56 @@ async def counts() -> Dict[str, Any]:
     return {"total": total, "fresh": fresh}
 
 
+_TOOL_LINE_RE = None  # compiled lazily below
+
+
+def _extract_tools_from_flat(content: str):
+    """Split inline ``[ran tool: name]`` chunks out of a flattened turn.
+
+    Returns (clean_text, {name: count}). Used by /view only — the viewer
+    shows tool usage as a footer; import keeps the flattened inline form.
+    """
+    import re as _re
+
+    global _TOOL_LINE_RE
+    if _TOOL_LINE_RE is None:
+        _TOOL_LINE_RE = _re.compile(r"\[ran tool: ([^\]]+)\]")
+    counts: Dict[str, int] = {}
+    for name in _TOOL_LINE_RE.findall(content):
+        counts[name] = counts.get(name, 0) + 1
+    clean = _TOOL_LINE_RE.sub("", content)
+    clean = "\n\n".join(p for p in (s.strip() for s in clean.split("\n\n")) if p)
+    return clean, (counts or None)
+
+
+def _attach_claude_tools(jsonl_path: Path, turns: List[Dict[str, Any]]) -> None:
+    """Attach ``tools: {name: count}`` to claude view turns by extracting the
+    inline ``[ran tool: …]`` chunks the stock flattener emitted (exact counts,
+    no second file walk needed)."""
+    for turn in turns:
+        if turn["role"] == "assistant":
+            clean, counts = _extract_tools_from_flat(turn["content"])
+            turn["content"] = clean
+            if counts:
+                turn["tools"] = counts
+
+
 @router.get("/view")
 async def view_session(source: str, path: str) -> Dict[str, Any]:
     """Read-only transcript view. Reuses the same normalizers as import —
-    one parsing contract, two consumers."""
+    one parsing contract, two consumers. Turns may carry ``tools`` counts
+    for the viewer's per-message tool footer (import output never does)."""
     try:
         if source == "opencode":
             sid = path.removeprefix("opencode-db:")
-            parsed = parse_opencode_session(OPENCODE_DB, sid)
+            parsed = parse_opencode_session(OPENCODE_DB, sid, with_tools=True)
         elif source == "claude":
             from pathlib import Path as _P
 
             from hermes_cli.foreign_sessions import parse_claude_session
 
             parsed = parse_claude_session(_P(path))
+            _attach_claude_tools(_P(path), parsed["turns"])
         else:
             return {"ok": False, "error": f"unknown source {source!r}"}
         return {
