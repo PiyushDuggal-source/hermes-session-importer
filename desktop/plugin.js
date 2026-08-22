@@ -106,7 +106,11 @@ function ForeignSessionsPage({ rest }) {
       queryClient.invalidateQueries({ queryKey: [ID, 'list'] })
       if (res && res.ok && res.session_id) {
         haptic('tap')
-        host.openSession(res.session_id, { intent: 'tab' })
+        if (typeof host.openSession === 'function') {
+          host.openSession(res.session_id, { intent: 'tab' })
+        } else {
+          host.navigate('/chat/' + res.session_id)
+        }
       } else if (res && res.error) {
         host.notifyError(new Error(res.error), `Import failed: ${res.error}`)
       }
