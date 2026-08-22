@@ -396,7 +396,48 @@ async def list_all(source: str = "") -> Dict[str, Any]:
         )
         s["imported"] = bool(hit)
         s["imported_hermes_id"] = hit["hermes_id"] if hit else None
-    return {"sessions": sessions[:100], "errors": errors}
+    return {
+        "sessions": sessions[:500],
+        "total": len(sessions),
+        "errors": errors,
+    }
+
+
+@router.get("/counts")
+async def counts() -> Dict[str, Any]:
+    """Cheap count-only endpoint for the statusbar chip — no session rows."""
+    total = 0
+    fresh = 0
+    idx = imported_index()
+    for source in ("claude", "opencode"):
+        try:
+            if source == "claude":
+                from hermes_cli.foreign_sessions import list_claude_sessions
+
+                ids = [
+                    (s.source, s.session_id, str(s.path))
+                    for s in list_claude_sessions()
+                ]
+            else:
+                con = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True)
+                try:
+                    rows = con.execute(
+                        "SELECT id FROM session WHERE time_archived IS NULL"
+                    ).fetchall()
+                finally:
+                    con.close()
+                ids = [("opencode", sid, f"opencode-db:{sid}") for (sid,) in rows]
+            for src, fid, path in ids:
+                # cheap turn-presence check skipped: sessions with no turns
+                # are rare and the chip is approximate by design.
+                total += 1
+                if not (
+                    idx.get(f"{src}:{fid}") or idx.get(f"{src}:path:{path}")
+                ):
+                    fresh += 1
+        except Exception:
+            continue
+    return {"total": total, "fresh": fresh}
 
 
 @router.get("/view")

@@ -224,7 +224,7 @@ function Transcript({ rest, meta, onClose }) {
 function ProviderList({ rest, provider, onBack }) {
   const listQuery = useForeignList(rest, provider)
   const [viewing, setViewing] = useState(null)
-  const [search, setSearch] = useState(() => loadPref('search', ''))
+  const [search, setSearch] = useState(() => loadPref('search:' + provider, ''))
   const [cwdFilter, setCwdFilter] = useState(() => loadPref('cwd:' + provider, ''))
   const [confirmBulk, setConfirmBulk] = useState(false)
 
@@ -315,8 +315,11 @@ function ProviderList({ rest, provider, onBack }) {
 
   const newCount = sessions.filter((s) => !s.imported).length
 
-  const setSearchP = (v) => { setSearch(v); savePref('search', v) }
+  const setSearchP = (v) => { setSearch(v); savePref('search:' + provider, v) }
   const setCwdP = (v) => { setCwdFilter(v); savePref('cwd:' + provider, v) }
+
+  const total = (listQuery.data && listQuery.data.total) || sessions.length
+  const truncated = total > sessions.length
 
   return jsxs('div', { className: 'flex h-full flex-col', children: [
     jsxs('div', { className: 'flex items-center justify-between gap-2 px-4 pt-4 pb-2', children: [
@@ -373,6 +376,12 @@ function ProviderList({ rest, provider, onBack }) {
           }, c)))
         })
       : null,
+    truncated
+      ? jsx('div', {
+          className: 'px-4 pb-1 text-xs text-(--ui-text-quaternary)',
+          children: `Showing ${sessions.length} of ${total} sessions — oldest hidden. Import or search to reach older ones; raise the cap in the plugin backend if needed.`,
+        })
+      : null,
     errors.length > 0
       ? jsxs('div', { className: 'px-4 pb-2 text-xs text-(--ui-text-tertiary)', children: [
           jsx('div', { className: 'font-medium', children: 'Some sessions could not be read:' }),
@@ -426,18 +435,10 @@ function ForeignSessionsPage({ rest }) {
 // ── statusbar chip: unimported count across both providers ───────────────
 
 function ImportCountChip({ rest }) {
+  // Count-only endpoint: no session rows, no double /list load.
   const q = useQuery({
-    queryKey: [ID, 'chip'],
-    queryFn: async () => {
-      let total = 0, fresh = 0
-      for (const p of PROVIDERS) {
-        try {
-          const d = await rest(`/list?source=${p.key}`)
-          for (const s of (d.sessions || [])) { total += 1; if (!s.imported) fresh += 1 }
-        } catch { /* provider offline */ }
-      }
-      return { total, fresh }
-    },
+    queryKey: [ID, 'counts'],
+    queryFn: () => rest('/counts'),
     refetchInterval: 30000,
   })
   if (!q.data || !q.data.total) return null
@@ -496,7 +497,9 @@ export default {
         data: {
           id: 'session-importer.refresh',
           label: 'Refresh foreign sessions',
-          defaults: ['mod+shift+r'],
+          // No hard default: mod+shift+r collides with Chromium reload
+          // conventions — users bind it themselves in Settings.
+          defaults: [],
           run: () => refreshAll(),
         },
       },
