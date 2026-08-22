@@ -1,5 +1,8 @@
 # session-importer
 
+[![Demo](docs/demo-poster.jpg)](docs/demo.mp4)
+*Click to watch the demo (with sound).*
+
 A Hermes desktop plugin that surfaces your **Claude Code** and **OpenCode**
 session history inside Hermes. Browse them, read them properly formatted, and
 import any of them as a live, resumable Hermes session.
