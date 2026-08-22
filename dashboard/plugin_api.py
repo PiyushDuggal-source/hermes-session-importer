@@ -8,6 +8,12 @@ a SQLite DB, not JSONL, so the shipped claude/codex parsers don't apply).
 Dedup: every Hermes session imported from a foreign tool carries
 origin_json.imported_from.{tool, path, foreign_session_id}. /list indexes
 those keys at list-time so the pane can badge already-imported sessions.
+
+v1.1: /list uses a cheap SQL pass (first text part per message — no full
+parse, no per-session connections); full parse happens only at import or
+/view. Per-session parse failures surface in errors[] instead of being
+silently skipped. imported_index() is cached with a short TTL and reads
+origin_json in one SQL pass.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -29,6 +36,10 @@ if str(_HERMES_AGENT) not in sys.path:
 router = APIRouter()
 
 OPENCODE_DB = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+
+_INDEX_TTL_SECONDS = 30.0
+_index_cache: Optional[Dict[str, Dict[str, str]]] = None
+_index_cached_at = 0.0
 
 # ── OpenCode → normalized turns (same contract as foreign_sessions) ──────
 
@@ -128,8 +139,61 @@ def parse_opencode_session(db_path: Path, session_id: str) -> Dict[str, Any]:
     }
 
 
-def list_opencode_sessions(limit: int = 200) -> List[Dict[str, Any]]:
-    """Discover OpenCode sessions from its SQLite DB, newest first."""
+def _opencode_list_rows(limit: int) -> List[Dict[str, Any]]:
+    """Cheap list-only pass: one SQL query, first text part per message.
+
+    No full parse here — turn_count is the count of messages that would
+    produce a turn (user-with-text + non-empty assistant), which is what
+    the list UI needs. Full normalization happens only in parse_opencode_session.
+    """
+    if not OPENCODE_DB.is_file():
+        return []
+    con = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            """
+            SELECT s.id, s.directory, s.title, s.time_updated,
+                   COUNT(m.id) AS msg_count
+            FROM session s
+            LEFT JOIN message m ON m.session_id = s.id
+                 AND json_extract(m.data, '$.role') IN ('user','assistant')
+                 AND EXISTS (
+                     SELECT 1 FROM part p
+                     WHERE p.message_id = m.id
+                       AND json_extract(p.data, '$.type') = 'text'
+                       AND json_extract(p.data, '$.role') IS NULL
+                 )
+            WHERE s.time_archived IS NULL
+            GROUP BY s.id
+            ORDER BY s.time_updated DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        con.close()
+    out: List[Dict[str, Any]] = []
+    for sid, directory, title, tupdated, msg_count in rows:
+        out.append({
+            "source": "opencode",
+            "path": f"opencode-db:{sid}",
+            "mtime_ms": tupdated,
+            "cwd": directory,
+            "title": title,
+            "turn_count": msg_count,
+            "session_id": sid,
+        })
+    return out
+
+
+def list_opencode_sessions(
+    limit: int = 200, errors: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """Discover OpenCode sessions from its SQLite DB, newest first.
+
+    Parse failures (schema drift etc.) are appended to ``errors`` rather
+    than silently skipped, when ``errors`` is provided.
+    """
     results: List[Dict[str, Any]] = []
     if not OPENCODE_DB.is_file():
         return results
@@ -145,7 +209,9 @@ def list_opencode_sessions(limit: int = 200) -> List[Dict[str, Any]]:
     for sid, directory, title, tupdated in rows:
         try:
             parsed = parse_opencode_session(OPENCODE_DB, sid)
-        except Exception:
+        except Exception as exc:
+            if errors is not None:
+                errors.append(f"opencode {sid}: {exc}")
             continue
         if not parsed["turns"]:
             continue
@@ -161,7 +227,7 @@ def list_opencode_sessions(limit: int = 200) -> List[Dict[str, Any]]:
     return results
 
 
-def list_claude_sessions_meta() -> List[Dict[str, Any]]:
+def list_claude_sessions_meta(errors: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Discover Claude Code sessions via the stock importer's lister."""
     from hermes_cli.foreign_sessions import list_claude_sessions
 
@@ -179,11 +245,20 @@ def list_claude_sessions_meta() -> List[Dict[str, Any]]:
     return out
 
 
-# ── Dedup index ──────────────────────────────────────────────────────────
+# ── Dedup index (TTL-cached, one SQL pass) ───────────────────────────────
 
 
-def imported_index() -> Dict[str, Dict[str, str]]:
-    """Map 'tool:foreign_session_id' (or 'tool:path:path') → hermes session info."""
+def imported_index(force: bool = False) -> Dict[str, Dict[str, str]]:
+    """Map 'tool:foreign_session_id' (or 'tool:path:path') → hermes session info.
+
+    Cached for _INDEX_TTL_SECONDS; origin_json is read in a single SQL pass
+    instead of per-row get_session() calls.
+    """
+    global _index_cache, _index_cached_at
+    now = time.monotonic()
+    if not force and _index_cache is not None and (now - _index_cached_at) < _INDEX_TTL_SECONDS:
+        return _index_cache
+
     from hermes_state import SessionDB
 
     db = SessionDB()
@@ -192,17 +267,12 @@ def imported_index() -> Dict[str, Dict[str, str]]:
     # normalize to the lister's source names so lookups match.
     _ALIAS = {"claude-code": "claude", "codex-cli": "codex"}
     try:
-        rows = db.list_sessions_rich(
-            limit=500, compact_rows=True, include_hidden=True,
-            include_children=True,
-        )
-        for row in rows:
-            raw = None
-            try:
-                full = db.get_session(row["id"]) or {}
-                raw = full.get("origin_json")
-            except Exception:
-                raw = None
+        rows = db._conn.execute(
+            "SELECT id, title, origin_json FROM sessions "
+            "WHERE origin_json LIKE '%imported_from%' "
+            "ORDER BY started_at DESC LIMIT 1000"
+        ).fetchall()
+        for sid, title, raw in rows:
             if not raw:
                 continue
             try:
@@ -212,11 +282,13 @@ def imported_index() -> Dict[str, Dict[str, str]]:
             fid = imp.get("foreign_session_id")
             path = imp.get("path")
             tool = _ALIAS.get(imp.get("tool"), imp.get("tool"))
-            entry = {"hermes_id": row["id"], "title": row.get("title")}
+            entry = {"hermes_id": sid, "title": title}
             if tool and fid:
                 index[f"{tool}:{fid}"] = entry
             if tool and path:
                 index[f"{tool}:path:{path}"] = entry
+        _index_cache = index
+        _index_cached_at = now
         return index
     finally:
         try:
@@ -273,6 +345,8 @@ def _import_opencode(session_id: str) -> str:
             pass
         return new_id
     finally:
+        global _index_cache
+        _index_cache = None  # invalidate so the next /list sees the new import
         try:
             db.close()
         except Exception:
@@ -284,16 +358,23 @@ def _import_opencode(session_id: str) -> str:
 
 @router.get("/list")
 async def list_all(source: str = "") -> Dict[str, Any]:
+    """List foreign sessions cheaply.
+
+    OpenCode rows come from the aggregate SQL pass (no full parse).
+    Claude rows still go through the stock lister (it parses JSONL, but
+    Claude Code stores one small file per session — acceptable; the TTL'd
+    dedup cache removes the other hot path).
+    """
     sessions: List[Dict[str, Any]] = []
     errors: List[str] = []
     if source in ("", "claude"):
         try:
-            sessions.extend(list_claude_sessions_meta())
+            sessions.extend(list_claude_sessions_meta(errors=errors))
         except Exception as exc:
             errors.append(f"claude: {exc}")
     if source in ("", "opencode"):
         try:
-            sessions.extend(list_opencode_sessions())
+            sessions.extend(_opencode_list_rows(200))
         except Exception as exc:
             errors.append(f"opencode: {exc}")
     sessions.sort(key=lambda s: s.get("mtime_ms") or 0, reverse=True)
@@ -307,6 +388,32 @@ async def list_all(source: str = "") -> Dict[str, Any]:
         s["imported"] = bool(hit)
         s["imported_hermes_id"] = hit["hermes_id"] if hit else None
     return {"sessions": sessions[:100], "errors": errors}
+
+
+@router.get("/view")
+async def view_session(source: str, path: str) -> Dict[str, Any]:
+    """Read-only transcript view. Reuses the same normalizers as import —
+    one parsing contract, two consumers."""
+    try:
+        if source == "opencode":
+            sid = path.removeprefix("opencode-db:")
+            parsed = parse_opencode_session(OPENCODE_DB, sid)
+        elif source == "claude":
+            from pathlib import Path as _P
+
+            from hermes_cli.foreign_sessions import parse_claude_session
+
+            parsed = parse_claude_session(_P(path))
+        else:
+            return {"ok": False, "error": f"unknown source {source!r}"}
+        return {
+            "ok": True,
+            "title": parsed.get("title_guess"),
+            "cwd": parsed.get("cwd"),
+            "turns": parsed["turns"],
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 @router.post("/import")

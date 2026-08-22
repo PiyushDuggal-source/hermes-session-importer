@@ -1,8 +1,9 @@
 /**
- * session-importer — list Claude Code / OpenCode sessions, click to import
- * into Hermes as a resumable plain-text session and open it.
+ * session-importer — list Claude Code / OpenCode sessions, view them
+ * read-only, and import into Hermes as resumable plain-text sessions.
  *
- * Surface: sidebar nav row → full page route (/foreign-sessions).
+ * v1.1 surface: provider stepper (pick provider → list) with per-session
+ * View (read-only transcript) and Import actions.
  * Backend: dashboard/plugin_api.py via ctx.rest.
  */
 
@@ -25,13 +26,18 @@ import {
   useQuery,
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
+import { useState } from 'react'
 
 const ID = 'session-importer'
 const PATH = '/foreign-sessions'
 
-const PROVIDERS = {
-  claude: { label: 'Claude Code', codicon: 'sparkle' },
-  opencode: { label: 'OpenCode', codicon: 'terminal' },
+const PROVIDERS = [
+  { key: 'claude', label: 'Claude Code', codicon: 'sparkle', hint: '~/.claude/projects' },
+  { key: 'opencode', label: 'OpenCode', codicon: 'terminal', hint: 'opencode.db' },
+]
+
+function providerMeta(key) {
+  return PROVIDERS.find((p) => p.key === key) || { label: key, codicon: 'puzzle' }
 }
 
 function fmtTime(ms) {
@@ -47,56 +53,125 @@ function fmtCwd(cwd) {
   return parts[parts.length - 1] || cwd
 }
 
-function SessionRow({ s, onImport }) {
-  const prov = PROVIDERS[s.source] || { label: s.source }
-  return jsxs('button', {
-    type: 'button',
+function useForeignList(rest, provider) {
+  return useQuery({
+    queryKey: [ID, 'list', provider],
+    queryFn: () => rest(`/list?source=${provider}`),
+    refetchInterval: 5000,
+  })
+}
+
+function ProviderPicker({ onPick }) {
+  return jsxs('div', { className: 'flex h-full flex-col items-center justify-center gap-3 p-6', children: [
+    jsx('h2', { className: 'text-base font-semibold', children: 'Choose a provider' }),
+    jsx('div', { className: 'flex w-full max-w-sm flex-col gap-2', children:
+      PROVIDERS.map((p) => jsx('button', {
+        type: 'button',
+        className: cn(
+          'flex w-full items-center gap-3 rounded-lg border border-(--ui-stroke-secondary) px-4 py-3 text-left transition-colors',
+          'hover:bg-(--chrome-action-hover)'
+        ),
+        onClick: () => { haptic('tap'); onPick(p.key) },
+        children: [
+          jsx(Codicon, { name: p.codicon, size: 18 }),
+          jsxs('div', { className: 'flex-1', children: [
+            jsx('div', { className: 'text-sm font-medium', children: p.label }),
+            jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: p.hint }),
+          ]}),
+          jsx(Codicon, { name: 'chevron-right', size: 14 }),
+        ],
+      }, p.key))
+    }),
+  ]})
+}
+
+function SessionRow({ s, onView, onImport }) {
+  return jsxs('div', {
     className: cn(
-      'group flex w-full items-start gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors',
+      'group flex w-full items-start gap-2 rounded-md px-3 py-2 text-sm transition-colors',
       'hover:bg-(--chrome-action-hover)'
     ),
-    onClick: () => onImport(s),
     children: [
-      jsx('div', {
-        className: 'mt-0.5 shrink-0',
-        children: jsx(Codicon, { name: prov.codicon, size: 14 }),
+      jsxs('button', {
+        type: 'button',
+        className: 'min-w-0 flex-1 text-left',
+        onClick: () => onView(s),
+        children: [
+          jsx('div', { className: 'truncate font-medium', children: s.title || s.session_id || s.path }),
+          jsxs('div', {
+            className: 'flex items-center gap-2 text-xs text-(--ui-text-tertiary)',
+            children: [
+              jsx('span', { children: fmtTime(s.mtime_ms) }),
+              s.cwd ? jsx('span', { children: fmtCwd(s.cwd) }) : null,
+              jsx('span', { children: `${s.turn_count} turns` }),
+            ],
+          }),
+        ],
       }),
-      jsxs('div', { className: 'min-w-0 flex-1', children: [
-        jsx('div', {
-          className: 'truncate font-medium',
-          children: s.title || s.session_id || s.path,
-        }),
-        jsxs('div', {
-          className: 'flex items-center gap-2 text-xs text-(--ui-text-tertiary)',
-          children: [
-            jsx('span', { children: fmtTime(s.mtime_ms) }),
-            s.cwd ? jsx('span', { children: fmtCwd(s.cwd) }) : null,
-            jsx('span', { children: `${s.turn_count} turns` }),
-          ],
-        }),
-      ]}),
-      jsx('div', {
-        className: 'shrink-0 self-center',
-        children: s.imported
+      jsxs('div', { className: 'flex shrink-0 items-center gap-1 self-center', children: [
+        s.imported
           ? jsx(Tip, {
               label: `Already imported — opens ${s.imported_hermes_id}`,
               children: jsx(Badge, { variant: 'secondary', children: 'imported' }),
             })
-          : jsx('span', {
-              className:
-                'text-xs text-(--ui-text-quaternary) opacity-0 group-hover:opacity-100',
-              children: 'click to import →',
-            }),
-      }),
+          : null,
+        jsx(Button, {
+          variant: 'ghost', size: 'sm',
+          onClick: () => onView(s),
+          children: 'View',
+        }),
+        jsx(Button, {
+          variant: 'secondary', size: 'sm',
+          onClick: () => onImport(s),
+          children: 'Import',
+        }),
+      ]}),
     ],
   })
 }
 
-function ForeignSessionsPage({ rest }) {
-  const listQuery = useQuery({
-    queryKey: [ID, 'list'],
-    queryFn: () => rest('/list'),
-    refetchInterval: 5000,
+function Transcript({ data, onClose }) {
+  return jsxs('div', { className: 'flex h-full flex-col', children: [
+    jsxs('div', { className: 'flex items-center justify-between px-4 pt-4 pb-2', children: [
+      jsxs('div', { className: 'min-w-0', children: [
+        jsx('div', { className: 'truncate text-sm font-semibold', children: data.title || 'Untitled session' }),
+        data.cwd ? jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: data.cwd }) : null,
+      ]}),
+      jsx(Button, { variant: 'ghost', size: 'sm', onClick: onClose, children: '← Back' }),
+    ]}),
+    jsx('div', { className: 'flex-1 overflow-y-auto px-4 pb-4', children:
+      (data.turns || []).map((t, i) => jsxs('div', { className: 'mb-3', children: [
+        jsx('div', {
+          className: cn(
+            'mb-1 text-xs font-medium uppercase tracking-wide',
+            t.role === 'user' ? 'text-(--ui-accent)' : 'text-(--ui-text-quaternary)'
+          ),
+          children: t.role,
+        }),
+        jsx('div', {
+          className: cn(
+            'whitespace-pre-wrap rounded-md px-3 py-2 text-sm',
+            t.role === 'user' ? 'bg-(--chrome-action-hover)' : ''
+          ),
+          children: t.content,
+        }),
+      ]}, i))
+    }),
+  ]})
+}
+
+function ProviderList({ rest, provider, onBack }) {
+  const listQuery = useForeignList(rest, provider)
+  const [viewing, setViewing] = useState(null)
+
+  const viewMut = useMutation({
+    mutationFn: (s) =>
+      rest(`/view?source=${s.source}&path=${encodeURIComponent(s.path)}`),
+    onSuccess: (res) => {
+      if (res && res.ok) setViewing(res)
+      else if (res && res.error) host.notifyError(new Error(res.error), 'View failed')
+    },
+    onError: (err) => host.notifyError(err, 'View failed'),
   })
 
   const importMut = useMutation({
@@ -118,20 +193,13 @@ function ForeignSessionsPage({ rest }) {
     onError: (err) => host.notifyError(err, 'Import failed'),
   })
 
-  const doImport = (s) => {
-    // Already-imported sessions open directly instead of re-importing.
-    if (s.imported && s.imported_hermes_id) {
-      host.openSession(s.imported_hermes_id, { intent: 'tab' })
-      return
-    }
-    importMut.mutate(s)
+  if (viewing) {
+    return jsx(Transcript, { data: viewing, onClose: () => setViewing(null) })
   }
 
   if (listQuery.isLoading) {
     return jsxs('div', { className: 'flex h-full flex-col gap-2 p-4', children: [
-      jsx(Skeleton, {}),
-      jsx(Skeleton, {}),
-      jsx(Skeleton, {}),
+      jsx(Skeleton, {}), jsx(Skeleton, {}), jsx(Skeleton, {}),
     ]})
   }
   if (listQuery.isError) {
@@ -140,72 +208,71 @@ function ForeignSessionsPage({ rest }) {
       ? ' If you just enabled this plugin, fully quit Hermes (⌘Q) and relaunch — plugin API routes mount only at server startup.'
       : ''
     return jsx(ErrorState, {
-      title: `Could not load foreign sessions${status ? ` (HTTP ${status})` : ''}`,
+      title: `Could not load sessions${status ? ` (HTTP ${status})` : ''}`,
       error: listQuery.error,
-      description: `Backend /api/plugins/session-importer/list failed.${staleHint}`,
+      description: `Backend /api/plugins/${ID}/list failed.${staleHint}`,
     })
   }
 
   const sessions = (listQuery.data && listQuery.data.sessions) || []
   const errors = (listQuery.data && listQuery.data.errors) || []
-
-  const groups = Object.keys(PROVIDERS)
-    .map((key) => ({
-      key,
-      label: PROVIDERS[key].label,
-      items: sessions.filter((s) => s.source === key),
-    }))
-    .filter((g) => g.items.length > 0)
+  const meta = providerMeta(provider)
 
   return jsxs('div', { className: 'flex h-full flex-col', children: [
-    jsxs('div', {
-      className: 'flex items-center justify-between px-4 pt-4 pb-2',
-      children: [
-        jsx('h2', { className: 'text-base font-semibold', children: 'Foreign Sessions' }),
-        jsx(Button, {
-          variant: 'ghost',
-          size: 'sm',
-          onClick: () => listQuery.refetch(),
-          disabled: listQuery.isFetching,
-          children: listQuery.isFetching ? 'refreshing…' : 'Refresh',
-        }),
-      ],
-    }),
+    jsxs('div', { className: 'flex items-center justify-between px-4 pt-4 pb-2', children: [
+      jsxs('div', { className: 'flex items-center gap-2', children: [
+        jsx(Button, { variant: 'ghost', size: 'sm', onClick: onBack, children: '←' }),
+        jsxs('h2', { className: 'text-base font-semibold', children: [
+          meta.label, ` (${sessions.length})`,
+        ]}),
+      ]}),
+      jsx(Button, {
+        variant: 'ghost', size: 'sm',
+        onClick: () => listQuery.refetch(),
+        disabled: listQuery.isFetching,
+        children: listQuery.isFetching ? 'refreshing…' : 'Refresh',
+      }),
+    ]}),
     errors.length > 0
-      ? jsx('div', {
-          className: 'px-4 pb-2 text-xs text-(--ui-text-tertiary)',
-          children: errors.join(' · '),
-        })
+      ? jsxs('div', { className: 'px-4 pb-2 text-xs text-(--ui-text-tertiary)', children: [
+          jsx('div', { className: 'font-medium', children: 'Some sessions could not be read:' }),
+          errors.slice(0, 3).map((e, i) => jsx('div', { key: i, className: 'truncate', children: e })),
+        ]})
       : null,
     jsx('div', { className: 'flex-1 overflow-y-auto pb-4', children:
-      groups.length === 0
+      sessions.length === 0
         ? jsx(EmptyState, {
             icon: 'history',
-            title: 'No foreign sessions found',
-            description:
-              'Sessions from Claude Code (~/.claude/projects) and OpenCode will appear here.',
+            title: `No ${meta.label} sessions found`,
+            description: 'Sessions will appear here as you use the tool.',
           })
-        : groups.map((g) =>
-            jsxs('div', { className: 'mb-4', children: [
-              jsx('div', {
-                className:
-                  'px-4 py-1 text-xs font-medium uppercase tracking-wide text-(--ui-text-quaternary)',
-                children: `${g.label} (${g.items.length})`,
-              }),
-              g.items.map((s) =>
-                jsx(SessionRow, { s, onImport: doImport }, `${s.source}:${s.session_id}`)
-              ),
-            ]}, g.key)
+        : sessions.map((s) =>
+            jsx(SessionRow, {
+              s,
+              onView: (x) => viewMut.mutate(x),
+              onImport: (x) => importMut.mutate(x),
+            }, s.session_id || s.path)
           ),
     }),
-    importMut.isPending
+    importMut.isPending || viewMut.isPending
       ? jsx('div', {
           className: 'px-4 py-2 text-xs text-(--ui-text-tertiary)',
-          children: 'Importing…',
+          children: importMut.isPending ? 'Importing…' : 'Loading transcript…',
         })
       : null,
   ]})
 }
+
+function ForeignSessionsPage({ rest }) {
+  const [provider, setProvider] = useState(null)
+  if (!provider) return jsx(ProviderPicker, { onPick: setProvider })
+  return jsx(ProviderList, {
+    rest, provider,
+    onBack: () => setProvider(null),
+  })
+}
+
+// useState must come from the app's React; imported above from 'react'.
 
 export default {
   id: ID,
